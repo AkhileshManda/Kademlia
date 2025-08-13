@@ -1,9 +1,14 @@
 use rand::Rng;
+use sha1::{Digest, Sha1};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Kademlia's bucket size (commonly 20 in papers); we use a smaller number for demo
 const K: usize = 8;
+/// Concurrency factor alpha in Kademlia (number of parallel queries); we serialize for simplicity
+const ALPHA: usize = 3;
+/// Max iterations for lookup to avoid infinite loops in small demos
+const MAX_STEPS: usize = 8;
 
 /// A 160-bit identifier, like in Kademlia (commonly from SHA-1 space)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -15,6 +20,11 @@ impl NodeId {
         let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 20];
         rng.fill(&mut bytes);
+        NodeId(bytes)
+    }
+
+    /// Construct from a 20-byte array
+    fn from_bytes(bytes: [u8; 20]) -> Self {
         NodeId(bytes)
     }
 
@@ -133,6 +143,31 @@ impl Network {
         id.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Compute a key's 160-bit ID using SHA-1
+    fn key_to_id(key: &[u8]) -> NodeId {
+        let digest = Sha1::digest(key);
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(&digest[..20]);
+        NodeId::from_bytes(bytes)
+    }
+
+    /// Snapshot known peers of a node (to avoid borrow issues during iteration)
+    fn snapshot_peers(&self, id: &NodeId) -> Vec<NodeId> {
+        self.nodes.get(id).map(|n| n.peers.clone()).unwrap_or_default()
+    }
+
+    /// Return up to K closest nodes from `candidates` to `target` (by XOR)
+    fn closest_k(&self, target: &NodeId, candidates: &[NodeId]) -> Vec<NodeId> {
+        let mut list = candidates.to_vec();
+        list.sort_by(|a, b| {
+            let da = target.xor_distance(a);
+            let db = target.xor_distance(b);
+            compare_distances(&da, &db)
+        });
+        list.truncate(K);
+        list
+    }
+
     /// RPC forwarding: ping from one node to another
     fn ping(&mut self, from: &NodeId, to: &NodeId) -> Option<bool> {
         let target = self.nodes.get_mut(to)?;
@@ -157,6 +192,97 @@ impl Network {
         let target = self.nodes.get_mut(to)?;
         Some(target.rpc_find_node(from, target_id))
     }
+
+    /// Iterative find_node: start from `start`, walk the network to find K closest to `target`
+    fn iterative_find_node(&mut self, start: &NodeId, target: &NodeId) -> Vec<NodeId> {
+        let mut queried: Vec<NodeId> = Vec::new();
+        let mut shortlist: Vec<NodeId> = self.snapshot_peers(start);
+        if !shortlist.contains(start) {
+            shortlist.push(*start);
+        }
+        shortlist = self.closest_k(target, &shortlist);
+
+        for _step in 0..MAX_STEPS {
+            // pick up to ALPHA closest not-yet-queried nodes
+            let mut batch: Vec<NodeId> = Vec::new();
+            for n in &shortlist {
+                if !queried.contains(n) {
+                    batch.push(*n);
+                }
+                if batch.len() == ALPHA { break; }
+            }
+            if batch.is_empty() { break; }
+
+            let mut any_progress = false;
+            for n in batch {
+                queried.push(n);
+                if let Some(neighbors) = self.find_node(start, &n, target) {
+                    // merge neighbors into shortlist
+                    for m in neighbors {
+                        if !shortlist.contains(&m) {
+                            shortlist.push(m);
+                        }
+                    }
+                    let before = shortlist.clone();
+                    shortlist = self.closest_k(target, &shortlist);
+                    if shortlist != before { any_progress = true; }
+                }
+            }
+            if !any_progress { break; }
+        }
+        self.closest_k(target, &shortlist)
+    }
+
+    /// Iterative find_value: like find_node but stop if a value is found
+    fn iterative_find_value(&mut self, start: &NodeId, key: &[u8]) -> Option<Vec<u8>> {
+        let key_id = Self::key_to_id(key);
+        let mut queried: Vec<NodeId> = Vec::new();
+        let mut shortlist: Vec<NodeId> = self.snapshot_peers(start);
+        if !shortlist.contains(start) {
+            shortlist.push(*start);
+        }
+        shortlist = self.closest_k(&key_id, &shortlist);
+
+        for _step in 0..MAX_STEPS {
+            let mut batch: Vec<NodeId> = Vec::new();
+            for n in &shortlist {
+                if !queried.contains(n) {
+                    batch.push(*n);
+                }
+                if batch.len() == ALPHA { break; }
+            }
+            if batch.is_empty() { break; }
+
+            let mut any_progress = false;
+            for n in batch {
+                queried.push(n);
+                if let Some(result) = self.find_value(start, &n, key) {
+                    if let Some(value) = result { return Some(value); }
+                }
+                if let Some(neighbors) = self.find_node(start, &n, &key_id) {
+                    for m in neighbors {
+                        if !shortlist.contains(&m) {
+                            shortlist.push(m);
+                        }
+                    }
+                    let before = shortlist.clone();
+                    shortlist = self.closest_k(&key_id, &shortlist);
+                    if shortlist != before { any_progress = true; }
+                }
+            }
+            if !any_progress { break; }
+        }
+        None
+    }
+
+    /// Iterative store: route to K closest nodes to key_id and store there
+    fn iterative_store(&mut self, start: &NodeId, key: Vec<u8>, value: Vec<u8>) {
+        let key_id = Self::key_to_id(&key);
+        let closest = self.iterative_find_node(start, &key_id);
+        for target in closest {
+            let _ = self.store(start, &target, key.clone(), value.clone());
+        }
+    }
 }
 
 fn main() {
@@ -175,19 +301,20 @@ fn main() {
     let _ = network.ping(&id2, &id0);
     let _ = network.ping(&id2, &id1);
 
-    // Inter-node store and lookup
+    // Iterative store: route to K closest to the key
     let key = b"hello".to_vec();
     let value = b"world".to_vec();
-    network.store(&id1, &id0, key.clone(), value.clone());
-    let got = network.find_value(&id2, &id0, &key).unwrap_or(None);
+    network.iterative_store(&id1, key.clone(), value.clone());
+
+    // Iterative find_value from id2
+    let got = network.iterative_find_value(&id2, &key);
     println!(
-        "Lookup on node 0 (asked by 2): {:?}",
+        "Iterative find_value from node2 for 'hello': {:?}",
         got.map(|v| String::from_utf8_lossy(&v).to_string())
     );
 
-    // Ask node 0 for nodes closest to id2
-    if let Some(closest) = network.find_node(&id1, &id0, &id2) {
-        let list: Vec<String> = closest.iter().map(|nid| Network::id_hex(nid)).collect();
-        println!("Closest (from node 0's view) to node2: {:?}", list);
-    }
+    // Show iterative find_node for id2 starting from id0
+    let closest_to_id2 = network.iterative_find_node(&id0, &id2);
+    let list: Vec<String> = closest_to_id2.iter().map(|nid| Network::id_hex(nid)).collect();
+    println!("Iterative closest to id2 (from id0): {:?}", list);
 }
