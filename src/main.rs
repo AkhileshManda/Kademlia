@@ -62,24 +62,85 @@ impl Node {
     }
 }
 
-fn main() {
-    // Create a few nodes and print their IDs
-    let mut nodes: Vec<Node> = (0..3).map(|_| Node::new()).collect();
+/// An in-memory network that owns nodes and forwards RPC calls between them
+struct Network {
+    nodes: HashMap<NodeId, Node>,
+}
 
-    for (i, node) in nodes.iter().enumerate() {
-        // Print ID as hex for readability
-        let hex_id: String = node.id.0.iter().map(|b| format!("{b:02x}")).collect();
-        println!("Node {i}: {hex_id}");
+impl Network {
+    fn new() -> Self {
+        Self { nodes: HashMap::new() }
     }
 
-    // Minimal demo of RPC-like methods locally (we'll add inter-node comms next)
+    /// Create and register a new node with a unique ID; returns its NodeId
+    fn add_node(&mut self) -> NodeId {
+        loop {
+            let node = Node::new();
+            if !self.nodes.contains_key(&node.id) {
+                let id = node.id;
+                self.nodes.insert(id, node);
+                return id;
+            }
+        }
+    }
+
+    /// Helper to print a node's ID as hex
+    fn id_hex(id: &NodeId) -> String {
+        id.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// RPC forwarding: ping from one node to another
+    fn ping(&self, from: &NodeId, to: &NodeId) -> Option<bool> {
+        let target = self.nodes.get(to)?;
+        Some(target.rpc_ping(from))
+    }
+
+    /// RPC forwarding: store a key/value on a target node
+    fn store(&mut self, from: &NodeId, to: &NodeId, key: Vec<u8>, value: Vec<u8>) -> Option<()> {
+        let target = self.nodes.get_mut(to)?;
+        // from is unused now, but will be useful for routing/permissions later
+        let _ = from;
+        target.rpc_store(key, value);
+        Some(())
+    }
+
+    /// RPC forwarding: find_value on a target node
+    fn find_value(&self, from: &NodeId, to: &NodeId, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let target = self.nodes.get(to)?;
+        let _ = from;
+        Some(target.rpc_find_value(key))
+    }
+
+    /// RPC forwarding: find_node on a target node
+    fn find_node(&self, from: &NodeId, to: &NodeId, target_id: &NodeId) -> Option<Vec<NodeId>> {
+        let target = self.nodes.get(to)?;
+        let _ = from;
+        Some(target.rpc_find_node(target_id))
+    }
+}
+
+fn main() {
+    // Build a small in-memory network and add nodes
+    let mut network = Network::new();
+    let id0 = network.add_node();
+    let id1 = network.add_node();
+    let id2 = network.add_node();
+
+    println!("Node 0: {}", Network::id_hex(&id0));
+    println!("Node 1: {}", Network::id_hex(&id1));
+    println!("Node 2: {}", Network::id_hex(&id2));
+
+    // Inter-node RPC calls through the network
+    let alive = network.ping(&id1, &id0).unwrap_or(false);
+    println!("Ping from 1 -> 0: {}", alive);
+
     let key = b"hello".to_vec();
     let value = b"world".to_vec();
 
-    // Store on node 0
-    nodes[0].rpc_store(key.clone(), value.clone());
+    // Node 1 asks Node 0 to store a value
+    network.store(&id1, &id0, key.clone(), value.clone());
 
-    // Find value on node 0
-    let got = nodes[0].rpc_find_value(&key);
-    println!("Lookup on node 0: {:?}", got.map(|v| String::from_utf8_lossy(&v).to_string()));
+    // Node 2 asks Node 0 to look up the value
+    let got = network.find_value(&id2, &id0, &key).unwrap_or(None);
+    println!("Lookup on node 0 (asked by 2): {:?}", got.map(|v| String::from_utf8_lossy(&v).to_string()));
 }
