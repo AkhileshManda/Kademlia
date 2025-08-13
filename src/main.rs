@@ -1,5 +1,9 @@
 use rand::Rng;
+use std::cmp::Ordering;
 use std::collections::HashMap;
+
+/// Kademlia's bucket size (commonly 20 in papers); we use a smaller number for demo
+const K: usize = 8;
 
 /// A 160-bit identifier, like in Kademlia (commonly from SHA-1 space)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -24,11 +28,24 @@ impl NodeId {
     }
 }
 
+/// Compare two 160-bit distances (big-endian) for sorting
+fn compare_distances(a: &[u8; 20], b: &[u8; 20]) -> Ordering {
+    for i in 0..20 {
+        if a[i] < b[i] {
+            return Ordering::Less;
+        } else if a[i] > b[i] {
+            return Ordering::Greater;
+        }
+    }
+    Ordering::Equal
+}
+
 /// A basic node in the DHT
 #[derive(Debug)]
 struct Node {
     id: NodeId,
     storage: HashMap<Vec<u8>, Vec<u8>>, // very simple key-value store
+    peers: Vec<NodeId>,                  // simplified k-bucket: LRU list, max K
 }
 
 impl Node {
@@ -37,28 +54,55 @@ impl Node {
         Self {
             id: NodeId::random(),
             storage: HashMap::new(),
+            peers: Vec::new(),
+        }
+    }
+
+    /// Update local peer list (LRU behavior, max K, no self)
+    fn track_peer(&mut self, peer: &NodeId) {
+        if *peer == self.id {
+            return;
+        }
+        if let Some(pos) = self.peers.iter().position(|p| p == peer) {
+            let existing = self.peers.remove(pos);
+            self.peers.push(existing);
+        } else {
+            self.peers.push(*peer);
+            if self.peers.len() > K {
+                self.peers.remove(0);
+            }
         }
     }
 
     /// RPC: ping - used to check liveness
-    fn rpc_ping(&self, _from: &NodeId) -> bool {
+    fn rpc_ping(&mut self, from: &NodeId) -> bool {
+        self.track_peer(from);
         true
     }
 
     /// RPC: store - store a key/value locally
-    fn rpc_store(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    fn rpc_store(&mut self, from: &NodeId, key: Vec<u8>, value: Vec<u8>) {
+        self.track_peer(from);
         self.storage.insert(key, value);
     }
 
     /// RPC: find_value - try to get a value for a key
-    fn rpc_find_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn rpc_find_value(&mut self, from: &NodeId, key: &[u8]) -> Option<Vec<u8>> {
+        self.track_peer(from);
         self.storage.get(key).cloned()
     }
 
-    /// RPC: find_node - return known nodes closest to the target id
-    /// For now, we don't track peers yet, so return empty. We'll fill this in later.
-    fn rpc_find_node(&self, _target: &NodeId) -> Vec<NodeId> {
-        Vec::new()
+    /// RPC: find_node - return up to K known nodes closest to the target id
+    fn rpc_find_node(&mut self, from: &NodeId, target: &NodeId) -> Vec<NodeId> {
+        self.track_peer(from);
+        let mut peers = self.peers.clone();
+        peers.sort_by(|a, b| {
+            let da = target.xor_distance(a);
+            let db = target.xor_distance(b);
+            compare_distances(&da, &db)
+        });
+        peers.truncate(K);
+        peers
     }
 }
 
@@ -90,32 +134,28 @@ impl Network {
     }
 
     /// RPC forwarding: ping from one node to another
-    fn ping(&self, from: &NodeId, to: &NodeId) -> Option<bool> {
-        let target = self.nodes.get(to)?;
+    fn ping(&mut self, from: &NodeId, to: &NodeId) -> Option<bool> {
+        let target = self.nodes.get_mut(to)?;
         Some(target.rpc_ping(from))
     }
 
     /// RPC forwarding: store a key/value on a target node
     fn store(&mut self, from: &NodeId, to: &NodeId, key: Vec<u8>, value: Vec<u8>) -> Option<()> {
         let target = self.nodes.get_mut(to)?;
-        // from is unused now, but will be useful for routing/permissions later
-        let _ = from;
-        target.rpc_store(key, value);
+        target.rpc_store(from, key, value);
         Some(())
     }
 
     /// RPC forwarding: find_value on a target node
-    fn find_value(&self, from: &NodeId, to: &NodeId, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        let target = self.nodes.get(to)?;
-        let _ = from;
-        Some(target.rpc_find_value(key))
+    fn find_value(&mut self, from: &NodeId, to: &NodeId, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let target = self.nodes.get_mut(to)?;
+        Some(target.rpc_find_value(from, key))
     }
 
     /// RPC forwarding: find_node on a target node
-    fn find_node(&self, from: &NodeId, to: &NodeId, target_id: &NodeId) -> Option<Vec<NodeId>> {
-        let target = self.nodes.get(to)?;
-        let _ = from;
-        Some(target.rpc_find_node(target_id))
+    fn find_node(&mut self, from: &NodeId, to: &NodeId, target_id: &NodeId) -> Option<Vec<NodeId>> {
+        let target = self.nodes.get_mut(to)?;
+        Some(target.rpc_find_node(from, target_id))
     }
 }
 
@@ -130,17 +170,24 @@ fn main() {
     println!("Node 1: {}", Network::id_hex(&id1));
     println!("Node 2: {}", Network::id_hex(&id2));
 
-    // Inter-node RPC calls through the network
-    let alive = network.ping(&id1, &id0).unwrap_or(false);
-    println!("Ping from 1 -> 0: {}", alive);
+    // Bootstrap: let nodes learn about each other by contacting
+    let _ = network.ping(&id1, &id0);
+    let _ = network.ping(&id2, &id0);
+    let _ = network.ping(&id2, &id1);
 
+    // Inter-node store and lookup
     let key = b"hello".to_vec();
     let value = b"world".to_vec();
-
-    // Node 1 asks Node 0 to store a value
     network.store(&id1, &id0, key.clone(), value.clone());
-
-    // Node 2 asks Node 0 to look up the value
     let got = network.find_value(&id2, &id0, &key).unwrap_or(None);
-    println!("Lookup on node 0 (asked by 2): {:?}", got.map(|v| String::from_utf8_lossy(&v).to_string()));
+    println!(
+        "Lookup on node 0 (asked by 2): {:?}",
+        got.map(|v| String::from_utf8_lossy(&v).to_string())
+    );
+
+    // Ask node 0 for nodes closest to id2
+    if let Some(closest) = network.find_node(&id1, &id0, &id2) {
+        let list: Vec<String> = closest.iter().map(|nid| Network::id_hex(nid)).collect();
+        println!("Closest (from node 0's view) to node2: {:?}", list);
+    }
 }
