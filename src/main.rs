@@ -56,6 +56,7 @@ struct Node {
     id: NodeId,
     storage: HashMap<Vec<u8>, Vec<u8>>, // very simple key-value store
     peers: Vec<NodeId>,                  // simplified k-bucket: LRU list, max K
+    alive: bool,                         // liveness flag
 }
 
 impl Node {
@@ -65,6 +66,7 @@ impl Node {
             id: NodeId::random(),
             storage: HashMap::new(),
             peers: Vec::new(),
+            alive: true,
         }
     }
 
@@ -81,6 +83,13 @@ impl Node {
             if self.peers.len() > K {
                 self.peers.remove(0);
             }
+        }
+    }
+
+    /// Remove a peer if present
+    fn evict_peer(&mut self, peer: &NodeId) {
+        if let Some(pos) = self.peers.iter().position(|p| p == peer) {
+            self.peers.remove(pos);
         }
     }
 
@@ -138,6 +147,33 @@ impl Network {
         }
     }
 
+    /// Add a new node and bootstrap it via a known peer
+    fn add_and_join(&mut self, bootstrap: &NodeId) -> Option<NodeId> {
+        let id = self.add_node();
+        // try to contact bootstrap so it learns about us (and vice versa)
+        let _ = self.ping(&id, bootstrap);
+        // run a find_node towards our own ID to discover neighbors
+        let _ = self.iterative_find_node(&id, &id);
+        Some(id)
+    }
+
+    /// Mark a node as dead (simulate failure)
+    fn kill_node(&mut self, id: &NodeId) -> bool {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.alive = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a peer from every node's peer list
+    fn evict_peer_from_all(&mut self, peer: &NodeId) {
+        for node in self.nodes.values_mut() {
+            node.evict_peer(peer);
+        }
+    }
+
     /// Helper to print a node's ID as hex
     fn id_hex(id: &NodeId) -> String {
         id.0.iter().map(|b| format!("{b:02x}")).collect()
@@ -171,12 +207,14 @@ impl Network {
     /// RPC forwarding: ping from one node to another
     fn ping(&mut self, from: &NodeId, to: &NodeId) -> Option<bool> {
         let target = self.nodes.get_mut(to)?;
+        if !target.alive { return None; }
         Some(target.rpc_ping(from))
     }
 
     /// RPC forwarding: store a key/value on a target node
     fn store(&mut self, from: &NodeId, to: &NodeId, key: Vec<u8>, value: Vec<u8>) -> Option<()> {
         let target = self.nodes.get_mut(to)?;
+        if !target.alive { return None; }
         target.rpc_store(from, key, value);
         Some(())
     }
@@ -184,12 +222,14 @@ impl Network {
     /// RPC forwarding: find_value on a target node
     fn find_value(&mut self, from: &NodeId, to: &NodeId, key: &[u8]) -> Option<Option<Vec<u8>>> {
         let target = self.nodes.get_mut(to)?;
+        if !target.alive { return None; }
         Some(target.rpc_find_value(from, key))
     }
 
     /// RPC forwarding: find_node on a target node
     fn find_node(&mut self, from: &NodeId, to: &NodeId, target_id: &NodeId) -> Option<Vec<NodeId>> {
         let target = self.nodes.get_mut(to)?;
+        if !target.alive { return None; }
         Some(target.rpc_find_node(from, target_id))
     }
 
@@ -216,6 +256,11 @@ impl Network {
             let mut any_progress = false;
             for n in batch {
                 queried.push(n);
+                // Skip or evict dead/unreachable peers
+                if self.ping(start, &n) != Some(true) {
+                    self.evict_peer_from_all(&n);
+                    continue;
+                }
                 if let Some(neighbors) = self.find_node(start, &n, target) {
                     // merge neighbors into shortlist
                     for m in neighbors {
@@ -256,6 +301,11 @@ impl Network {
             let mut any_progress = false;
             for n in batch {
                 queried.push(n);
+                // Skip or evict dead/unreachable peers
+                if self.ping(start, &n) != Some(true) {
+                    self.evict_peer_from_all(&n);
+                    continue;
+                }
                 if let Some(result) = self.find_value(start, &n, key) {
                     if let Some(value) = result { return Some(value); }
                 }
@@ -280,7 +330,11 @@ impl Network {
         let key_id = Self::key_to_id(&key);
         let closest = self.iterative_find_node(start, &key_id);
         for target in closest {
-            let _ = self.store(start, &target, key.clone(), value.clone());
+            if self.ping(start, &target) == Some(true) {
+                let _ = self.store(start, &target, key.clone(), value.clone());
+            } else {
+                self.evict_peer_from_all(&target);
+            }
         }
     }
 }
@@ -306,15 +360,23 @@ fn main() {
     let value = b"world".to_vec();
     network.iterative_store(&id1, key.clone(), value.clone());
 
-    // Iterative find_value from id2
-    let got = network.iterative_find_value(&id2, &key);
+    // Add a new node and join via id0
+    let id3 = network.add_and_join(&id0).expect("join failed");
+    println!("Node 3 (joined via 0): {}", Network::id_hex(&id3));
+
+    // Kill node 1 (simulate failure)
+    let _ = network.kill_node(&id1);
+    println!("Simulated failure: node 1 is now dead");
+
+    // Iterative find_value from id3 should still work; dead peers get evicted
+    let got = network.iterative_find_value(&id3, &key);
     println!(
-        "Iterative find_value from node2 for 'hello': {:?}",
+        "Iterative find_value from node3 for 'hello': {:?}",
         got.map(|v| String::from_utf8_lossy(&v).to_string())
     );
 
-    // Show iterative find_node for id2 starting from id0
-    let closest_to_id2 = network.iterative_find_node(&id0, &id2);
+    // Show iterative find_node for id2 starting from id3 (skips dead nodes)
+    let closest_to_id2 = network.iterative_find_node(&id3, &id2);
     let list: Vec<String> = closest_to_id2.iter().map(|nid| Network::id_hex(nid)).collect();
-    println!("Iterative closest to id2 (from id0): {:?}", list);
+    println!("Iterative closest to id2 (from id3): {:?}", list);
 }
