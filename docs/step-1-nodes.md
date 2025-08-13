@@ -40,5 +40,10 @@ Lookup on node 0: Some("world")
 - `Cargo.toml`: added the `rand` dependency
 - `src/main.rs`: defines `NodeId`, `Node`, and the RPC-like method stubs; runs a tiny demo in `main()`
 
+### Some clarifications
+- **Why `[u8; 20]` for 160 bits?** There’s no built-in `u160` in Rust. 160 bits = 20 bytes, so `[u8; 20]` is a simple, fixed-size representation that’s easy to copy, compare, and hash.
+- **Does XOR work properly here?** Yes. We XOR byte-by-byte, which is equivalent to XOR-ing all 160 bits. Endianness doesn’t affect XOR; it only matters if we later compare distances numerically, in which case we’ll treat the bytes as big-endian.
+- **What if random generates the same ID twice?** The collision probability in a 160-bit space is astronomically small. If desired, we can keep a `HashSet<NodeId>` of assigned IDs and regenerate on collision, or derive IDs deterministically (e.g., from a public key).
+
 ### What’s next (Step 2)
 We’ll introduce a simple in-memory “network” so that nodes can call each other’s RPC methods (ping, store, find_value, find_node) rather than calling themselves directly. This will set us up to add realistic behavior and routing in later steps. 
